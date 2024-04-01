@@ -1,17 +1,24 @@
 use core::time;
 use std::{
+    borrow::BorrowMut,
+    collections::HashMap,
     env::temp_dir,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, RwLock,
+    },
 };
 
 use lazycell::LazyCell;
 use nix::sys::stat;
 use nix::unistd;
+use serde_json::Value;
+use uuid::Uuid;
 
 fn make_fifo(path: &PathBuf) {
     let _ = fs::remove_file(path);
@@ -28,18 +35,63 @@ fn create_socket_listener(path: &PathBuf) -> UnixListener {
     UnixListener::bind(path).unwrap()
 }
 
-fn handle_stream(mut stream: UnixStream, sender: Sender<String>) {
+fn handle_stream(mut stream: UnixStream, id: &str, sender: Sender<String>) {
     println!("New connection!!");
     loop {
-        let mut buffer = String::new();
-        let size = stream.read_to_string(&mut buffer).unwrap();
+        // this buffer is used to read data from the pipe
+        // for some fucking reason, reading to a string doesn't work, so I'm just using a huge 0.5MB static buffer instead
+        // TODO: either figure out why read_to_string doesn't work or add multiple smaller buffers together to only allocate the amount necessary
+        let mut buffer = [0; 1000 * 500];
+
+        let size = stream.read(&mut buffer).unwrap();
 
         // if size is 0, that means the socket was shut down, so just exit the loop (and thread) then
         if size == 0 {
             break;
         }
 
-        sender.send(buffer).unwrap();
+        let buffer_str = std::str::from_utf8(&buffer[..size]).unwrap().trim();
+
+        // transform message first before sending it off
+        let message = transform_message(&buffer_str, id);
+        if message.is_some() {
+            sender.send(message.unwrap()).unwrap();
+        }
+    }
+}
+
+/// Add an id field to the message json
+fn transform_message(message: &str, id: &str) -> Option<String> {
+    match serde_json::from_str::<Value>(message) {
+        Ok(parsed_message) => {
+            let mut new_message = parsed_message.clone();
+            new_message["id"] = id.into();
+
+            Some(new_message.to_string())
+        }
+
+        Err(_) => None,
+    }
+}
+
+fn get_message_id(message: &str) -> Option<String> {
+    match serde_json::from_str::<Value>(message) {
+        Ok(parsed_message) => {
+            let id = parsed_message.get("id");
+
+            if id.is_some() {
+                let id_str = id.unwrap().as_str();
+                if id_str.is_some() {
+                    Some(id_str.unwrap().to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+
+        Err(_) => None,
     }
 }
 
@@ -62,15 +114,23 @@ fn main() {
     // ===================
     let (sender, receiver): (Sender<String>, Receiver<String>) = mpsc::channel();
 
+    let sockets = Arc::new(RwLock::new(HashMap::new()));
+    let sockets_clone = Arc::clone(&sockets);
+
     let socket_path = temp_dir().as_path().join("joshu.socket");
     let socket_listener = create_socket_listener(&socket_path);
     std::thread::spawn(move || loop {
         let (stream, _address) = socket_listener.accept().unwrap();
 
+        let uuid = Uuid::new_v4().as_hyphenated().to_string();
+        sockets_clone
+            .write()
+            .unwrap()
+            .insert(uuid.clone(), stream.try_clone().unwrap());
+
         let sender_clone = sender.clone();
-        let stream_clone = stream.try_clone().unwrap();
         std::thread::spawn(move || {
-            handle_stream(stream_clone, sender_clone);
+            handle_stream(stream, &uuid, sender_clone);
         });
     });
 
@@ -91,6 +151,16 @@ fn main() {
 
         let size = in_fifo.read(&mut buffer).unwrap();
         let buffer_str = std::str::from_utf8(&buffer[..size]).unwrap().trim();
+        let message_id = get_message_id(buffer_str);
+        if message_id.is_some() {
+            match sockets.read().unwrap().get(&message_id.unwrap()) {
+                Some(mut stream) => {
+                    let _ = stream.write_all(buffer_str.as_bytes());
+                }
+
+                None => {}
+            }
+        }
         println!("Joshu output: '{}'", buffer_str);
     });
 
